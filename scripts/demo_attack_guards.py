@@ -117,10 +117,10 @@ async def main() -> None:
             pass_live.append((name, prompt))
         print()
 
-    key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not key:
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key or key.startswith("your-"):
         print(
-            "No GOOGLE_API_KEY / .env — stopped before live LLM calls.\n"
+            "No OPENROUTER_API_KEY / .env — stopped before live LLM calls.\n"
             "Add key to .env then re-run: python scripts/demo_attack_guards.py"
         )
         print(f"Prompts that would reach the model: {len(pass_live)}")
