@@ -240,8 +240,10 @@ class GuardsOutputPlugin(base_plugin.BasePlugin):
 def create_guards_agent():
     """Create VinBank agent with strong input + output guardrails (bonus target)."""
     plugins = [GuardsInputPlugin(), GuardsOutputPlugin()]
+    from core.config import get_chat_model
+
     agent = llm_agent.LlmAgent(
-        model="gemini-3.1-flash-lite",
+        model=get_chat_model(),
         name="guards_assistant",
         instruction=GUARDS_INSTRUCTION,
     )

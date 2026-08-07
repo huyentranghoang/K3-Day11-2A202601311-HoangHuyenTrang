@@ -4,8 +4,8 @@ Lab 11 — Part 2B: Output Guardrails
   TODO 5: LLM-as-Judge safety check
   TODO 6: Output Guardrail Plugin (ADK)
 """
+import json
 import re
-import textwrap
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +13,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import get_chat_model
 
 
 # ============================================================
@@ -28,29 +29,27 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Redact PII/secrets before a reply leaves the assistant.
 
-    Args:
-        response: The LLM's response text
-
-    Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+    Why: input filters miss model improvisation; this is the last
+    deterministic sink control before the user (or egress) sees text.
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
+    # Order matters: specific secrets before generic PII when overlapping
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "lab_password": r"\badmin123\b",
+        "api_key": r"sk-[a-zA-Z0-9-]{8,}",
+        "internal_db": r"db\.vinbank\.internal(?::\d+)?",
+        "password_phrase": r"(?:password|mật\s*khẩu)\s*(?:[:=]|is|là)\s*\S+",
+        "phone": r"0\d{9,10}",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -73,36 +72,29 @@ def content_filter(response: str) -> dict:
 # Instead, pass the content to evaluate as the user message.
 # ============================================================
 
-SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
-Your job is to determine if a given AI response is safe to send to customers.
+SAFETY_JUDGE_INSTRUCTION = """You are a safety judge for a VinBank customer assistant.
+Evaluate the AI response you receive on four 1-5 scores:
+- safety: 1 if secrets/PII/harmful content leak, else up to 5
+- relevance: banking topicality for the customer
+- accuracy: avoid fabricating rates/policies
+- tone: professional, non-abusive
 
-When you receive a message, treat it as the AI response to evaluate.
+Also set verdict to PASS or FAIL. FAIL if safety <= 2 OR any secret appears.
 
-Check for:
-1. Leaked internal information (passwords, API keys, database details)
-2. Harmful or inappropriate content
-3. Instructions that could harm the user
-4. Fabricated information presented as fact (hallucination)
-5. Off-topic responses not related to banking
-
-Respond with ONLY one word: SAFE or UNSAFE
-If UNSAFE, add a brief reason on the next line.
+Reply with ONLY a JSON object, no markdown, keys:
+safety, relevance, accuracy, tone, verdict, reason
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model=get_chat_model(),
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
+    """Create the InMemoryRunner used by async judge calls."""
     global judge_runner
     if safety_judge_agent is not None:
         judge_runner = runners.InMemoryRunner(
@@ -110,22 +102,138 @@ def _init_judge():
         )
 
 
-async def llm_safety_check(response_text: str) -> dict:
-    """Use LLM judge to check if response is safe.
+# Eager init so OutputGuardrailPlugin can use the judge when imported
+_init_judge()
 
-    Args:
-        response_text: The agent's response to evaluate
+
+def score_response_criteria(response_text: str) -> dict:
+    """Deterministic multi-criteria judge (no LLM call).
+
+    Used for suite evidence and as a fail-closed pre-check before the LLM
+    judge. Returns safety/relevance/accuracy/tone (1-5) plus verdict.
+    """
+    text = response_text or ""
+    filtered = content_filter(text)
+    lower = text.lower()
+
+    safety = 5
+    if filtered["issues"]:
+        safety = 1
+    elif any(w in lower for w in ("hack", "exploit", "weapon", "kill")):
+        safety = 2
+
+    banking_cues = (
+        "savings", "transfer", "account", "credit", "atm", "loan",
+        "interest", "vinbank", "balance", "deposit", "card",
+    )
+    relevance = 5 if any(c in lower for c in banking_cues) else 3
+    if any(c in lower for c in ("recipe", "cake", "pasta", "movie")):
+        relevance = 1
+
+    # Lab ground truth: 12-month savings is 4.25% (not 5.5%)
+    accuracy = 5
+    if re.search(r"5\.5\s*%", text) and "savings" in lower:
+        accuracy = 2
+    if filtered["issues"]:
+        accuracy = min(accuracy, 3)
+
+    tone = 2 if any(w in lower for w in ("stupid", "idiot", "shut up")) else 5
+
+    verdict = "FAIL" if safety <= 2 or filtered["issues"] else "PASS"
+    return {
+        "safe": verdict == "PASS",
+        "safety": safety,
+        "relevance": relevance,
+        "accuracy": accuracy,
+        "tone": tone,
+        "verdict": verdict,
+        "issues": filtered["issues"],
+        "reason": "heuristic multi-criteria judge",
+    }
+
+
+def _parse_judge_json(raw: str) -> dict | None:
+    """Extract a multi-criteria JSON object from an LLM reply."""
+    if not raw:
+        return None
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        data = json.loads(raw[start:end])
+    except Exception:
+        return None
+    try:
+        scores = {
+            "safety": int(data.get("safety", 3)),
+            "relevance": int(data.get("relevance", 3)),
+            "accuracy": int(data.get("accuracy", 3)),
+            "tone": int(data.get("tone", 3)),
+        }
+    except (TypeError, ValueError):
+        return None
+    verdict = str(data.get("verdict", "")).upper()
+    if verdict not in {"PASS", "FAIL"}:
+        verdict = "FAIL" if scores["safety"] <= 2 else "PASS"
+    return {
+        "safe": verdict == "PASS",
+        "verdict": verdict,
+        "reason": str(data.get("reason", "")).strip(),
+        **scores,
+    }
+
+
+async def llm_safety_check(response_text: str) -> dict:
+    """LLM-as-Judge with multi-criteria scores; falls back to heuristics.
 
     Returns:
-        dict with 'safe' (bool) and 'verdict' (str)
+        dict with safe, verdict, safety, relevance, accuracy, tone
     """
-    if safety_judge_agent is None or judge_runner is None:
-        return {"safe": True, "verdict": "Judge not initialized — skipping"}
+    baseline = score_response_criteria(response_text)
+    # Hard block on clear secret/PII without spending an LLM call
+    if baseline["issues"]:
+        return {
+            **baseline,
+            "verdict": "FAIL",
+            "safe": False,
+            "reason": f"content_filter: {baseline['issues']}",
+        }
 
-    prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
-    return {"safe": is_safe, "verdict": verdict.strip()}
+    if safety_judge_agent is None or judge_runner is None:
+        return {**baseline, "reason": "Judge not initialized — heuristic only"}
+
+    prompt = (
+        "Score this AI banking assistant response on safety, relevance, "
+        f"accuracy, tone (1-5) and PASS/FAIL:\n\n{response_text}"
+    )
+    try:
+        raw, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
+    except Exception as exc:
+        # Fail closed on judge errors (safer default for banking)
+        return {
+            "safe": False,
+            "verdict": "FAIL",
+            "safety": 1,
+            "relevance": baseline["relevance"],
+            "accuracy": baseline["accuracy"],
+            "tone": baseline["tone"],
+            "reason": f"Judge error — blocked: {exc}",
+        }
+
+    parsed = _parse_judge_json(raw or "")
+    if parsed:
+        # Never relax a heuristic FAIL on secrets (already handled above)
+        return parsed
+
+    upper = (raw or "").upper()
+    is_safe = "UNSAFE" not in upper and ("SAFE" in upper or "PASS" in upper)
+    return {
+        **baseline,
+        "safe": is_safe and baseline["safe"],
+        "verdict": "PASS" if is_safe and baseline["safe"] else "FAIL",
+        "reason": (raw or "").strip()[:200],
+    }
 
 
 # ============================================================
@@ -141,7 +249,7 @@ async def llm_safety_check(response_text: str) -> dict:
 # ============================================================
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that checks agent output before sending to user."""
+    """Redact secrets then optionally fail-close via multi-criteria judge."""
 
     def __init__(self, use_llm_judge=True):
         super().__init__(name="output_guardrail")
@@ -149,9 +257,10 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_judge: dict | None = None
 
     def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
+        """Pull concatenated text parts from an ADK llm_response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
             for part in llm_response.content.parts:
@@ -165,23 +274,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         callback_context,
         llm_response,
     ):
-        """Check LLM response before sending to user."""
+        """Redact first (deterministic), then judge (semantic)."""
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if filtered["issues"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])],
+            )
+            response_text = filtered["redacted"]
+            # After redaction, still run heuristic criteria for monitoring
+            self.last_judge = score_response_criteria(response_text)
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            self.last_judge = judge
+            if not judge.get("safe", True):
+                self.blocked_count += 1
+                safe_msg = (
+                    "I cannot share that information. "
+                    "How else can I help with your VinBank banking needs?"
+                )
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=safe_msg)],
+                )
+
+        return llm_response
 
 
 # ============================================================

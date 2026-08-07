@@ -14,7 +14,11 @@ from google.genai import types
 
 
 class RateLimitPlugin(base_plugin.BasePlugin):
-    """Block users who exceed max_requests within window_seconds."""
+    """Per-user sliding-window limiter (cost / flooding control).
+
+    Separate from content guardrails: a well-formed banking flood still hurts
+    availability and API spend, so we block after max_requests / window.
+    """
 
     def __init__(self, max_requests: int = 10, window_seconds: int = 60):
         super().__init__(name="rate_limiter")
@@ -25,25 +29,30 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         self.total_count = 0
 
     def _block_response(self, message: str) -> types.Content:
+        """Build a model-role ADK Content used as the user-visible block."""
         return types.Content(
             role="model",
             parts=[types.Part.from_text(text=message)],
         )
 
     async def on_user_message_callback(self, *, invocation_context, user_message):
-        """Return Content to block, or None to allow."""
+        """Allow when under quota; otherwise return a rate-limit message."""
         self.total_count += 1
         user_id = getattr(invocation_context, "user_id", None) or "anonymous"
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # Drop timestamps outside the sliding window
+        cutoff = now - self.window_seconds
+        while window and window[0] < cutoff:
+            window.popleft()
+
+        if len(window) >= self.max_requests:
+            wait = self.window_seconds - (now - window[0])
+            self.blocked_count += 1
+            return self._block_response(
+                f"Rate limit exceeded. Try again in {wait:.0f}s."
+            )
+
+        window.append(now)
+        return None
